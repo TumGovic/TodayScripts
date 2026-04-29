@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# xrayvpn.sh v1.0 (sing-box core)
-# inbound: VLESS Reality (TCP/443) -> outbound: direct
+# xrayvpn.sh v1.1 (sing-box core)
+# inbound: VLESS Reality или VLESS TLS на своём домене (TCP/443) -> outbound: direct
 #
 # ВАЖНО:
 # - JSON sing-box генерируется только jq
@@ -14,7 +14,7 @@ set -eEuo pipefail
 # Константы / Пути
 ########################################
 readonly SCRIPT_NAME="xrayvpn"
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 
 readonly STATE_DIR="/etc/xrayvpn"
 readonly STATE_FILE="${STATE_DIR}/config.conf"
@@ -259,6 +259,11 @@ write_state_kv() {
     printf 'SB_BIN=%q\n' "${SB_BIN:-$SB_BIN_DEFAULT}"
     printf 'SERVER_ADDR=%q\n' "${SERVER_ADDR:-}"
     printf 'VLESS_PORT=%q\n' "${VLESS_PORT:-$FIXED_VLESS_PORT}"
+    printf 'TLS_MODE=%q\n' "${TLS_MODE:-reality}"
+    printf 'MASK_DOMAIN=%q\n' "${MASK_DOMAIN:-}"
+    printf 'ACME_EMAIL=%q\n' "${ACME_EMAIL:-}"
+    printf 'CERT_PATH=%q\n' "${CERT_PATH:-}"
+    printf 'KEY_PATH=%q\n' "${KEY_PATH:-}"
     printf 'REALITY_SNI=%q\n' "${REALITY_SNI:-}"
     printf 'REALITY_DEST=%q\n' "${REALITY_DEST:-}"
     printf 'PRIVATE_KEY=%q\n' "${PRIVATE_KEY:-}"
@@ -361,6 +366,130 @@ parse_dest() {
   return 1
 }
 
+normalize_tls_mode() {
+  local m
+  m="$(trim_ws "${1:-}")"
+  case "$m" in
+    reality|REALITY) echo "reality" ;;
+    domain|tls|TLS|own-domain|own_domain|cert|certificate) echo "domain" ;;
+    *) return 1 ;;
+  esac
+}
+
+is_domain_name() {
+  local d="${1:-}"
+  [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+get_public_ipv4() { curl -4 -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true; }
+get_public_ipv6() { curl -6 -fsSL --max-time 5 https://api64.ipify.org 2>/dev/null || true; }
+
+resolve_domain_ips() {
+  local domain="${1:-}"
+  getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true
+}
+
+ip_in_list() {
+  local needle="${1:-}"; shift || true
+  local ip
+  for ip in "$@"; do
+    [[ "$ip" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+check_mask_domain_dns() {
+  local domain="${1:-}" server_addr="${2:-}" strict="${3:-false}"
+  is_domain_name "$domain" || die "Домен маскировки выглядит некорректно: $domain"
+
+  local pub4 pub6 resolved=()
+  pub4="$(get_public_ipv4)"
+  pub6="$(get_public_ipv6)"
+  mapfile -t resolved < <(resolve_domain_ips "$domain")
+
+  if [[ ${#resolved[@]} -eq 0 ]]; then
+    die "DNS не резолвит $domain. Создай A/AAAA запись на IP сервера и дождись обновления DNS."
+  fi
+
+  log_info "DNS $domain -> ${resolved[*]}"
+  [[ -n "$pub4" ]] && log_info "Публичный IPv4 сервера: $pub4"
+  [[ -n "$pub6" ]] && log_info "Публичный IPv6 сервера: $pub6"
+
+  local ok="false"
+  [[ -n "$server_addr" ]] && ip_in_list "$server_addr" "${resolved[@]}" && ok="true"
+  [[ -n "$pub4" ]] && ip_in_list "$pub4" "${resolved[@]}" && ok="true"
+  [[ -n "$pub6" ]] && ip_in_list "$pub6" "${resolved[@]}" && ok="true"
+
+  if [[ "$ok" != "true" ]]; then
+    local msg="DNS $domain пока не указывает на этот сервер. Нужна A-запись на IPv4 сервера и/или AAAA на IPv6."
+    if [[ "$strict" == "true" ]]; then
+      die "$msg"
+    fi
+    log_warning "$msg"
+    log_warning "Если DNS только что изменён — подожди TTL и перезапусти install."
+  else
+    log_success "DNS выглядит нормально: домен указывает на сервер."
+  fi
+}
+
+ensure_port_80_free_or_exit() {
+  if port_is_listening 80; then
+    die "Порт 80 уже занят. Для Let's Encrypt HTTP-01 он должен быть свободен на время выпуска сертификата."
+  fi
+}
+
+install_certbot_if_needed() {
+  if have_cmd certbot; then
+    return 0
+  fi
+  log_info "Ставлю certbot для выпуска Let's Encrypt сертификата..."
+  install_packages certbot || die "Не удалось установить certbot. Установи certbot вручную или используй --cert-path/--key-path."
+}
+
+ensure_domain_certificate() {
+  local domain="${1:-}" email="${2:-}" cert_path="${3:-}" key_path="${4:-}"
+  if [[ -n "$cert_path" || -n "$key_path" ]]; then
+    [[ -f "$cert_path" ]] || die "Файл сертификата не найден: $cert_path"
+    [[ -f "$key_path" ]] || die "Файл ключа не найден: $key_path"
+    CERT_PATH="$cert_path"
+    KEY_PATH="$key_path"
+    log_success "Использую заданные сертификаты: $CERT_PATH / $KEY_PATH"
+    return 0
+  fi
+
+  install_certbot_if_needed
+
+  CERT_PATH="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  KEY_PATH="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+  if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
+    log_success "Сертификат уже есть: $CERT_PATH"
+  else
+    ensure_port_80_free_or_exit
+    local email_args=(--register-unsafely-without-email)
+    if [[ -n "$email" ]]; then
+      email_args=(--email "$email")
+    fi
+    log_info "Выпускаю сертификат Let's Encrypt для $domain через HTTP-01 (порт 80)..."
+    certbot certonly --standalone --non-interactive --agree-tos "${email_args[@]}" -d "$domain"
+    [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] || die "certbot завершился, но сертификат не найден: $CERT_PATH"
+    log_success "Сертификат выпущен: $CERT_PATH"
+  fi
+
+  chgrp -R "$SERVICE_GROUP" /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+  chmod 750 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+  find /etc/letsencrypt/live /etc/letsencrypt/archive -type d -exec chmod 750 {} + 2>/dev/null || true
+  find /etc/letsencrypt/live /etc/letsencrypt/archive -type f -name 'privkey*.pem' -exec chgrp "$SERVICE_GROUP" {} + -exec chmod 640 {} + 2>/dev/null || true
+  find /etc/letsencrypt/live /etc/letsencrypt/archive -type f -name 'fullchain*.pem' -exec chgrp "$SERVICE_GROUP" {} + -exec chmod 640 {} + 2>/dev/null || true
+
+  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy 2>/dev/null || true
+  cat > /etc/letsencrypt/renewal-hooks/deploy/xrayvpn-reload.sh <<EOF
+#!/usr/bin/env bash
+systemctl reload ${SERVICE_NAME} >/dev/null 2>&1 || systemctl restart ${SERVICE_NAME} >/dev/null 2>&1 || true
+EOF
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/xrayvpn-reload.sh
+}
+
 generate_reality_keypair() {
   local sb="${SB_BIN:-$SB_BIN_DEFAULT}"
   [[ -x "$sb" ]] || die "sing-box не найден: $sb"
@@ -415,15 +544,36 @@ build_tls_inbound_reality_json() {
   '
 }
 
+build_tls_inbound_domain_json() {
+  local domain="${1:-}" cert_path="${2:-}" key_path="${3:-}"
+  jq -c -n \
+    --arg domain "$domain" \
+    --arg cert "$cert_path" \
+    --arg key "$key_path" '
+    {
+      enabled: true,
+      server_name: $domain,
+      certificate_path: $cert,
+      key_path: $key
+    }
+  '
+}
+
 build_inbound_json() {
   local users_json="$1"
 
-  local dest_host dest_port
-  IFS='|' read -r dest_host dest_port <<< "$(parse_dest "${REALITY_DEST:-}" || true)"
-  [[ -n "${dest_host:-}" && -n "${dest_port:-}" ]] || die "Некорректный REALITY_DEST: ${REALITY_DEST:-}"
+  local dest_host="" dest_port=""
+  if [[ "${TLS_MODE:-reality}" == "reality" ]]; then
+    IFS='|' read -r dest_host dest_port <<< "$(parse_dest "${REALITY_DEST:-}" || true)"
+    [[ -n "${dest_host:-}" && -n "${dest_port:-}" ]] || die "Некорректный REALITY_DEST: ${REALITY_DEST:-}"
+  fi
 
   local tls_json
-  tls_json="$(build_tls_inbound_reality_json "$dest_host" "$dest_port" "${PRIVATE_KEY:-}" "${SHORT_ID:-}" "${REALITY_SNI:-}")"
+  if [[ "${TLS_MODE:-reality}" == "reality" ]]; then
+    tls_json="$(build_tls_inbound_reality_json "$dest_host" "$dest_port" "${PRIVATE_KEY:-}" "${SHORT_ID:-}" "${REALITY_SNI:-}")"
+  else
+    tls_json="$(build_tls_inbound_domain_json "${MASK_DOMAIN:-}" "${CERT_PATH:-}" "${KEY_PATH:-}")"
+  fi
 
   jq -c -n \
     --arg listen "0.0.0.0" \
@@ -478,9 +628,17 @@ render_singbox_config() {
   load_state
 
   [[ "${VLESS_PORT:-}" == "$FIXED_VLESS_PORT" ]] || die "VLESS_PORT должен быть ${FIXED_VLESS_PORT}"
-  [[ -n "${REALITY_DEST:-}" ]] || die "REALITY_DEST не задан"
-  [[ -n "${PRIVATE_KEY:-}" ]] || die "PRIVATE_KEY не задан"
-  [[ -n "${SHORT_ID:-}" ]] || die "SHORT_ID не задан"
+  TLS_MODE="$(normalize_tls_mode "${TLS_MODE:-reality}" || true)"
+  [[ -n "$TLS_MODE" ]] || die "TLS_MODE должен быть reality или domain"
+  if [[ "$TLS_MODE" == "reality" ]]; then
+    [[ -n "${REALITY_DEST:-}" ]] || die "REALITY_DEST не задан"
+    [[ -n "${PRIVATE_KEY:-}" ]] || die "PRIVATE_KEY не задан"
+    [[ -n "${SHORT_ID:-}" ]] || die "SHORT_ID не задан"
+  else
+    [[ -n "${MASK_DOMAIN:-}" ]] || die "MASK_DOMAIN не задан"
+    [[ -n "${CERT_PATH:-}" ]] || die "CERT_PATH не задан"
+    [[ -n "${KEY_PATH:-}" ]] || die "KEY_PATH не задан"
+  fi
 
   local users_json inbound_json inbounds_json outbounds_json route_json log_json
   users_json="$(build_users_json_from_db)"
@@ -693,15 +851,23 @@ generate_vless_url() {
     server="[$server]"
   fi
 
-  local sni_enc fp_enc flow_enc pbk_enc sid_enc
-  sni_enc="$(url_encode "$REALITY_SNI")"
+  local sni_enc fp_enc flow_enc pbk_enc sid_enc security
   fp_enc="$(url_encode "${FINGERPRINT:-chrome}")"
   flow_enc="$(url_encode "${FLOW:-$FIXED_FLOW}")"
-  pbk_enc="$(url_encode "$PUBLIC_KEY")"
-  sid_enc="$(url_encode "$SHORT_ID")"
 
-  local url="vless://${uuid}@${server}:${VLESS_PORT}?encryption=none&security=reality&sni=${sni_enc}&fp=${fp_enc}&pbk=${pbk_enc}&sid=${sid_enc}&type=tcp&headerType=none&flow=${flow_enc}#$(url_encode "$tag")"
-  echo "$url"
+  if [[ "${TLS_MODE:-reality}" == "domain" ]]; then
+    security="tls"
+    sni_enc="$(url_encode "${MASK_DOMAIN:-$SERVER_ADDR}")"
+    local url="vless://${uuid}@${server}:${VLESS_PORT}?encryption=none&security=${security}&sni=${sni_enc}&fp=${fp_enc}&type=tcp&headerType=none&flow=${flow_enc}#$(url_encode "$tag")"
+    echo "$url"
+  else
+    security="reality"
+    sni_enc="$(url_encode "$REALITY_SNI")"
+    pbk_enc="$(url_encode "$PUBLIC_KEY")"
+    sid_enc="$(url_encode "$SHORT_ID")"
+    local url="vless://${uuid}@${server}:${VLESS_PORT}?encryption=none&security=${security}&sni=${sni_enc}&fp=${fp_enc}&pbk=${pbk_enc}&sid=${sid_enc}&type=tcp&headerType=none&flow=${flow_enc}#$(url_encode "$tag")"
+    echo "$url"
+  fi
 }
 
 show_client_connection() {
@@ -716,6 +882,8 @@ show_client_connection() {
   echo
   echo "Клиент: $client_name"
   echo "UUID:   $uuid"
+  echo "Режим:  ${TLS_MODE:-reality}"
+  [[ "${TLS_MODE:-reality}" == "domain" ]] && echo "Домен:  ${MASK_DOMAIN:-}"
   echo
   echo "VLESS URI:"
   echo "$vless_url"
@@ -753,7 +921,7 @@ show_help() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION} (sing-box core)
 
 Команды:
-  install        Установка/настройка VPN (VLESS Reality TCP/443 -> direct)
+  install        Установка/настройка VPN (VLESS Reality или VLESS TLS на своём домене, TCP/443 -> direct)
   add            Добавить клиента
   remove         Удалить клиента
   list           Список клиентов
@@ -765,6 +933,11 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION} (sing-box core)
 Параметры (install):
   --non-interactive|--yes|-y
   --server-addr <ip|domain>
+  --tls-mode <reality|domain> (reality = старый режим, domain = свой домен + сертификат)
+  --mask-domain <domain>      домен для режима domain; A/AAAA должен указывать на сервер
+  --acme-email <email>        email для Let's Encrypt (опционально)
+  --cert-path <path>          свой fullchain.pem вместо certbot
+  --key-path <path>           свой privkey.pem вместо certbot
   --reality-sni <sni>
   --reality-dest <host:port>
   --fingerprint <fp>          (по умолчанию: chrome)
@@ -773,6 +946,11 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION} (sing-box core)
 
 Переменные окружения (install):
   XRAYVPN_SERVER_ADDR
+  XRAYVPN_TLS_MODE
+  XRAYVPN_MASK_DOMAIN
+  XRAYVPN_ACME_EMAIL
+  XRAYVPN_CERT_PATH
+  XRAYVPN_KEY_PATH
   XRAYVPN_REALITY_SNI
   XRAYVPN_REALITY_DEST
   XRAYVPN_FINGERPRINT
@@ -794,6 +972,11 @@ cmd_install() {
   local reset_keys="false"
 
   local server_addr="${XRAYVPN_SERVER_ADDR:-}"
+  local tls_mode="${XRAYVPN_TLS_MODE:-reality}"
+  local mask_domain="${XRAYVPN_MASK_DOMAIN:-}"
+  local acme_email="${XRAYVPN_ACME_EMAIL:-}"
+  local cert_path="${XRAYVPN_CERT_PATH:-}"
+  local key_path="${XRAYVPN_KEY_PATH:-}"
   local reality_sni="${XRAYVPN_REALITY_SNI:-}"
   local reality_dest="${XRAYVPN_REALITY_DEST:-}"
   local fp="${XRAYVPN_FINGERPRINT:-chrome}"
@@ -804,6 +987,11 @@ cmd_install() {
       --non-interactive|--yes|-y) non_interactive="true"; shift ;;
       --reset-keys) reset_keys="true"; shift ;;
       --server-addr) server_addr="${2:-}"; shift 2 ;;
+      --tls-mode) tls_mode="${2:-}"; shift 2 ;;
+      --mask-domain) mask_domain="${2:-}"; shift 2 ;;
+      --acme-email) acme_email="${2:-}"; shift 2 ;;
+      --cert-path) cert_path="${2:-}"; shift 2 ;;
+      --key-path) key_path="${2:-}"; shift 2 ;;
       --reality-sni) reality_sni="${2:-}"; shift 2 ;;
       --reality-dest) reality_dest="${2:-}"; shift 2 ;;
       --fingerprint) fp="${2:-}"; shift 2 ;;
@@ -817,6 +1005,8 @@ cmd_install() {
   fi
 
   # ДЕФОЛТЫ
+  tls_mode="$(normalize_tls_mode "$tls_mode" || true)"
+  [[ -n "$tls_mode" ]] || tls_mode="reality"
   [[ -n "$reality_sni" ]] || reality_sni="eh.vk.com"
   [[ -n "$reality_dest" ]] || reality_dest="eh.vk.com:443"
 
@@ -824,16 +1014,31 @@ cmd_install() {
     prompt_required "Публичный адрес сервера (SERVER_ADDR)" "${server_addr:-}" server_addr \
       "Можно IP или домен. (Если подсказка пустая — введи вручную.)"
 
-    prompt_default "Reality SNI (REALITY_SNI)" "${reality_sni}" reality_sni
-
     while true; do
-      prompt_default "Reality DEST (REALITY_DEST host:port)" "${reality_dest}" reality_dest
-      reality_dest="$(trim_ws "$reality_dest")"
-      if parse_dest "$reality_dest" >/dev/null 2>&1; then
-        break
-      fi
-      log_warning "REALITY_DEST должен быть в формате host:port (пример: example.com:443)"
+      prompt_default "Режим TLS: reality или domain" "${tls_mode}" tls_mode
+      tls_mode="$(normalize_tls_mode "$tls_mode" || true)"
+      [[ -n "$tls_mode" ]] && break
+      log_warning "Нужно ввести reality или domain"
     done
+
+    if [[ "$tls_mode" == "domain" ]]; then
+      prompt_required "Домен маскировки (A/AAAA -> этот сервер)" "${mask_domain:-}" mask_domain \
+        "Пример: vpn.example.com. На него будет выпущен Let's Encrypt сертификат."
+      prompt_default "Email для Let's Encrypt (можно пусто)" "${acme_email:-}" acme_email
+      prompt_default "Свой certificate_path/fullchain.pem (если уже есть, можно пусто)" "${cert_path:-}" cert_path
+      prompt_default "Свой key_path/privkey.pem (если уже есть, можно пусто)" "${key_path:-}" key_path
+    else
+      prompt_default "Reality SNI (REALITY_SNI)" "${reality_sni}" reality_sni
+
+      while true; do
+        prompt_default "Reality DEST (REALITY_DEST host:port)" "${reality_dest}" reality_dest
+        reality_dest="$(trim_ws "$reality_dest")"
+        if parse_dest "$reality_dest" >/dev/null 2>&1; then
+          break
+        fi
+        log_warning "REALITY_DEST должен быть в формате host:port (пример: example.com:443)"
+      done
+    fi
 
     prompt_default "Fingerprint (FINGERPRINT)" "${fp}" fp
 
@@ -845,7 +1050,15 @@ cmd_install() {
     [[ -n "$client_name" ]] || client_name="user1"
   fi
 
-  parse_dest "$reality_dest" >/dev/null || die "REALITY_DEST должен быть в формате host:port"
+  tls_mode="$(normalize_tls_mode "$tls_mode" || true)"
+  [[ -n "$tls_mode" ]] || die "TLS_MODE должен быть reality или domain"
+
+  if [[ "$tls_mode" == "domain" ]]; then
+    [[ -n "$mask_domain" ]] || die "Для --tls-mode domain нужен --mask-domain или XRAYVPN_MASK_DOMAIN"
+    is_domain_name "$mask_domain" || die "Некорректный домен: $mask_domain"
+  else
+    parse_dest "$reality_dest" >/dev/null || die "REALITY_DEST должен быть в формате host:port"
+  fi
 
   # Всегда фикс.
   VLESS_PORT="$FIXED_VLESS_PORT"
@@ -854,6 +1067,14 @@ cmd_install() {
   SB_BIN="$SB_BIN_DEFAULT"
   install_singbox
 
+  TLS_MODE="$tls_mode"
+  MASK_DOMAIN="$mask_domain"
+  ACME_EMAIL="$acme_email"
+  if [[ "$TLS_MODE" == "domain" ]]; then
+    check_mask_domain_dns "$MASK_DOMAIN" "$server_addr" "$non_interactive"
+    ensure_domain_certificate "$MASK_DOMAIN" "$ACME_EMAIL" "$cert_path" "$key_path"
+  fi
+
   # Если уже было установлено — по умолчанию НЕ ломаем клиентов.
   if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -861,20 +1082,24 @@ cmd_install() {
     : "${PRIVATE_KEY:=}"
     : "${PUBLIC_KEY:=}"
     : "${SHORT_ID:=}"
+    : "${CERT_PATH:=}"
+    : "${KEY_PATH:=}"
 
     if [[ "$reset_keys" == "true" ]]; then
       PRIVATE_KEY=""; PUBLIC_KEY=""; SHORT_ID=""
     fi
   fi
 
-  if [[ -z "${PRIVATE_KEY:-}" || -z "${PUBLIC_KEY:-}" || -z "${SHORT_ID:-}" ]]; then
-    local kp priv pub
-    kp="$(generate_reality_keypair)"
-    IFS='|' read -r priv pub <<< "$kp"
+  if [[ "$TLS_MODE" == "reality" ]]; then
+    if [[ -z "${PRIVATE_KEY:-}" || -z "${PUBLIC_KEY:-}" || -z "${SHORT_ID:-}" ]]; then
+      local kp priv pub
+      kp="$(generate_reality_keypair)"
+      IFS='|' read -r priv pub <<< "$kp"
 
-    PRIVATE_KEY="$priv"
-    PUBLIC_KEY="$pub"
-    SHORT_ID="$(generate_short_id)"
+      PRIVATE_KEY="$priv"
+      PUBLIC_KEY="$pub"
+      SHORT_ID="$(generate_short_id)"
+    fi
   fi
 
   SERVER_ADDR="$server_addr"
