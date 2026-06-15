@@ -858,7 +858,7 @@ build_route_json() {
 build_log_json() {
   jq -c -n '
     {
-      level: "info",
+      level: "warn",
       timestamp: true
     }
   '
@@ -973,6 +973,9 @@ NoNewPrivileges=true
 
 ExecStart=${sb} run -c ${SB_CONFIG_FILE}
 ExecReload=/bin/kill -HUP \$MAINPID
+
+StandardOutput=null
+StandardError=null
 
 Restart=on-failure
 RestartSec=2
