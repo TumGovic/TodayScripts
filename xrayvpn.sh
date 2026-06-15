@@ -621,7 +621,7 @@ build_route_json() {
 }
 
 build_log_json() {
-  jq -c -n '{ level: "info", timestamp: true }'
+  jq -c -n '{ level: "warn", timestamp: true }'
 }
 
 render_singbox_config() {
@@ -739,6 +739,9 @@ NoNewPrivileges=true
 
 ExecStart=${sb} run -c ${SB_CONFIG_FILE}
 ExecReload=/bin/kill -HUP \$MAINPID
+
+StandardOutput=null
+StandardError=null
 
 Restart=on-failure
 RestartSec=2
